@@ -12,7 +12,7 @@ function load() {
   }
   const disk = new Map(), timers = new Map(), events = new Map()
   const host = {
-    state: { profile: atom('a'), gateway: atom('closed'), connectionId: atom('local'), focusedSessionId: atom('runtime') },
+    state: { profile: atom('a'), gateway: atom('closed'), connectionId: atom('local'), focusedSessionId: atom('runtime'), focusedStoredSessionId: atom('s'), focusedUsage: atom(null), model: atom('test-model'), busyBySession: atom({}) },
     activeConnectionId: () => host.state.connectionId.get(),
     onEvent(name, fn) { events.set(fn, name); return () => events.delete(fn) },
     notify() {}, request: async () => ({})
@@ -22,10 +22,58 @@ function load() {
     setTimeout(fn) { const id = {}; timers.set(id, fn); return id }, clearTimeout(id) { timers.delete(id) }, setInterval() { return {} }, clearInterval() {},
     disk, timers, events, store: { get: (k, fallback) => disk.has(k) ? disk.get(k) : fallback, set: (k, v) => disk.set(k, v), remove: k => disk.delete(k) }
   })
-  vm.runInContext(source.replace(/^import .*$/mg, '').replace('export default {', 'globalThis.plugin = {'), ctx)
+  const pureStart = source.indexOf('/* @ledgerline:pure-start */')
+  const pureEnd = source.indexOf('/* @ledgerline:pure-end */')
+  if (pureStart < 0 || pureEnd <= pureStart) throw new Error('Ledgerline pure test boundary markers are missing')
+  const pureSource = source.slice(pureStart + '/* @ledgerline:pure-start */'.length, pureEnd)
+  const desktopSource = source.slice(pureEnd + '/* @ledgerline:pure-end */'.length)
+  const uiEnd = desktopSource.indexOf('// BEGIN SIGNED DESKTOP UPDATER')
+  if (uiEnd < 0) throw new Error('Ledgerline desktop UI test boundary is missing')
+  const uiSource = desktopSource.slice(0, uiEnd)
+  const componentStart = uiSource.indexOf('function Chip() {')
+  if (componentStart < 0) throw new Error('Ledgerline Chip component is missing')
+  const componentEnd = uiSource.indexOf('\n}\n', componentStart) + 3
+  if (componentEnd <= componentStart) throw new Error('Ledgerline Chip component end is missing')
+  const componentSource = uiSource.slice(componentStart, componentEnd)
+  const componentFunctionNames = [...uiSource.slice(0, componentStart).matchAll(/^function\s+([A-Za-z_$][\w$]*)\s*\(/gm)].map(match => match[1])
+  const shim = [...new Set([...componentFunctionNames, 'Chip'])].map(name => `globalThis.${name} = ${name};`).join('\n')
+  const registrationStart = source.lastIndexOf('export default {')
+  if (registrationStart < 0) throw new Error('Ledgerline default export is missing')
+  const registrationSource = source.slice(registrationStart).replace('export default {', 'globalThis.plugin = {')
+  const updaterStart = source.indexOf('function createDesktopUpdater(')
+  const updaterEnd = source.indexOf('// END SIGNED DESKTOP UPDATER', updaterStart)
+  if (updaterStart < 0 || updaterEnd <= updaterStart) throw new Error('Ledgerline desktop updater boundaries are missing')
+  const updaterSource = source.slice(updaterStart, updaterEnd)
+  vm.runInContext(`${pureSource}\n${uiSource.slice(0, componentStart)}\n${componentSource}\n${shim}\n${updaterSource}\nconst desktopUpdater = { register() {} };\n${registrationSource}`, ctx)
   vm.runInContext('storage = store', ctx)
+  vm.runInContext('globalThis.reduceLiveEvent = reduceLiveEvent; globalThis.emptyLive = emptyLive; globalThis.normalizeModelCallReceipt = normalizeModelCallReceipt;', ctx)
+  vm.runInContext('globalThis.applyLiveEvent = applyLiveEvent; globalThis.saveAnalysis = saveAnalysis; globalThis.watchBackground = watchBackground; globalThis.backgroundWatchers = backgroundWatchers; globalThis.scopeKey = scopeKey; globalThis.useAnalysis = useAnalysis; globalThis.runFullAudit = runFullAudit; globalThis.data = data;', ctx)
+  ctx.testLocaleSource = source
+  vm.runInContext('globalThis.loadLocaleBundles = () => ({ en: {} });', ctx)
+  const selectedComponents = ['Chip', 'LiveCard', 'ToolLine'].map(name => `globalThis.${name} = ${name};`).join('\n')
+  const liveCardStart = uiSource.indexOf('function LiveCard() {')
+  const liveCardEnd = uiSource.indexOf('\n}\n', liveCardStart) + 3
+  if (liveCardStart < 0 || liveCardEnd <= liveCardStart) throw new Error('Ledgerline live card boundaries are missing')
+  vm.runInContext(`${uiSource.slice(liveCardStart, liveCardEnd)}\n${selectedComponents}`, ctx)
   return { ctx, run: code => vm.runInContext(code, ctx), host, disk, timers, events }
 }
+
+test('gateway model-call receipt is the sole source of last-request attribution', () => {
+  const { run } = load()
+  const receipt = { call_index: 5, requested_model: 'plan', served_model: 'deepseek/deepseek-v4-pro', served_provider: 'OpenRouter', input_tokens: 1200, output_tokens: 40, total_tokens: 1240, cost_usd: 0.0012, cost_status: 'estimated', cost_source: 'litellm_response_header', attempted_fallbacks: 1 }
+  run(`globalThis.receipt = ${JSON.stringify(receipt)}`)
+  const state = run(`globalThis.lastState = reduceLiveEvent(null,{type:'session.usage',session_id:'r',payload:{usage:{model:'plan',provider:'litellm',input:9999,output:999,total:10998,latest_model_call:receipt}}},2)`)
+  assert.equal(state.latestCall.model, 'deepseek/deepseek-v4-pro')
+  assert.equal(state.latestCall.requestedModel, 'plan')
+  assert.equal(state.latestCall.total, 1240)
+  assert.equal(state.latestCall.costUsd, 0.0012)
+  assert.equal(state.latestCall.attemptedFallbacks, 1)
+  const next = run(`reduceLiveEvent(globalThis.lastState,{type:'message.start',session_id:'r',payload:{}},3)`)
+  assert.equal(next.latestCall, null)
+  const unknown = run(`reduceLiveEvent(null,{type:'message.complete',session_id:'r',payload:{usage:{latest_model_call:{call_index:6,requested_model:'plan',requested_provider:'litellm',served_model:null,served_provider:null,input_tokens:null,output_tokens:null,total_tokens:null,cost_usd:null,cost_status:'unknown',cost_source:'none'}}}},4)`)
+  assert.equal(unknown.latestCall.total, null)
+  assert.equal(unknown.latestCall.costUsd, null)
+})
 
 test('unfinished tools never become successful at turn completion', () => {
   const { run } = load()
@@ -227,6 +275,7 @@ for (const locale of ['zh', 'zh-hant', 'ja', 'ar', 'ru']) {
 
 test('live labels switch across all SDK locales and retain the English fallback', () => {
   const { run, bundles } = loadLocales()
+  run(`globalThis.sessionLabel = session => session.id`)
   const render = () => JSON.stringify(run('LiveCard()'))
   assert.match(render(), /tokens/)
   assert.match(render(), /n\/a/)
