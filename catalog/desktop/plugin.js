@@ -4681,7 +4681,7 @@ function LiveCardInner() {
         children: line(t('liveEstimate'), spentEstimated ? `${fmtUsd(spentNow)} ${t('estSuffix')}` : est ? `${fmtUsd(est.usd)} ${t('estSuffix')}` : t('liveNoRate'))
       }),
       childLive.count ? line(t('trueCost'), `${fmtUsd(spentNow)}${spentEstimated ? ` ${t('estSuffix')}` : ''}`) : null,
-      storedCost !== null ? line(t('spend'), `${fmtUsd(storedCost)} (${(selectedSession && selectedSession.cost && selectedSession.cost.status) || 'stored'})`) : null,
+      storedCost !== null ? line(t('spend'), selectedSession && selectedSession.cost && selectedSession.cost.status && selectedSession.cost.status !== 'unknown' ? `${fmtUsd(storedCost)} (${selectedSession.cost.status})` : fmtUsd(storedCost)) : null,
       sessionBudget.limit !== null ? line(t('budgetSessionLabel'), `${fmtUsd(sessionBudget.spent)} / ${fmtUsd(sessionBudget.limit)}`, sessionBudget.level === 'over' || sessionBudget.level === 'near' ? 'bad' : undefined) : null,
       line(t('liveTools'), `${tools.length}${failed ? ` (${failed} ${t('failed')})` : ''}`, failed ? 'bad' : undefined),
       lastTool ? jsx(ToolLine, { tool: lastTool, t }) : null,
