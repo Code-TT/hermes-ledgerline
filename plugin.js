@@ -1055,7 +1055,7 @@ function analyzeMessages(messages) {
 // the runtime session id and feeds every event through here.
 //
 // LiveSession = {
-//   runtimeId, storedId, model, busy, usage, contextPercent,
+//   runtimeId, storedId, model, provider, busy, usage, lastCall, contextPercent,
 //   tools: [{ toolId, name, args, startedAt, endedAt, durationS, verdict, error, summary }],
 //   subagents: [{ key, id, parentId, goal, model, status, currentTool, toolCount,
 //                 tokens: { input, output }, apiCalls, durationS, filesRead, filesWritten, summary }],
@@ -1072,14 +1072,43 @@ function emptyLive(runtimeId) {
     runtimeId,
     storedId: '',
     model: '',
+    provider: '',
     busy: false,
     usage: null,
     contextPercent: null,
     tools: [],
     subagents: [],
     lastComplete: null,
+    latestCall: null,
     text: '',
     updatedAt: 0
+  }
+}
+
+function normalizeModelCallReceipt(receipt) {
+  if (!receipt || typeof receipt !== 'object') return null
+  const input = receipt.input_tokens === null ? null : numOrNull(receipt.input_tokens)
+  const output = receipt.output_tokens === null ? null : numOrNull(receipt.output_tokens)
+  const total = receipt.total_tokens === null ? null : numOrNull(receipt.total_tokens)
+  const cost = receipt.cost_usd === null ? null : numOrNull(receipt.cost_usd)
+  return {
+    callIndex: num(receipt.call_index),
+    requestedModel: String(receipt.requested_model || ''),
+    model: String(receipt.served_model || ''),
+    provider: String(receipt.served_provider || ''),
+    apiBase: String(receipt.upstream_api_base || ''),
+    input,
+    output,
+    total,
+    reasoning: receipt.reasoning_tokens === null ? null : numOrNull(receipt.reasoning_tokens),
+    cacheRead: receipt.cache_read_tokens === null ? null : numOrNull(receipt.cache_read_tokens),
+    cacheWrite: receipt.cache_write_tokens === null ? null : numOrNull(receipt.cache_write_tokens),
+    costUsd: cost,
+    costStatus: String(receipt.cost_status || 'unknown'),
+    costSource: String(receipt.cost_source || 'none'),
+    attemptedFallbacks: receipt.attempted_fallbacks === null ? null : numOrNull(receipt.attempted_fallbacks),
+    responseId: String(receipt.response_id || ''),
+    at: Date.now()
   }
 }
 
@@ -1103,26 +1132,36 @@ function reduceLiveEvent(state, event, now = Date.now()) {
     case 'session.info': {
       if (p.stored_session_id) next.storedId = String(p.stored_session_id)
       if (p.model) next.model = String(p.model)
+      if (p.provider) next.provider = String(p.provider)
       if (typeof p.running === 'boolean') next.busy = p.running
-      if (p.usage && typeof p.usage === 'object') next.usage = { ...p.usage }
+      if (p.usage && typeof p.usage === 'object') {
+        next.usage = { ...p.usage }
+        if (p.usage.latest_model_call) next.latestCall = normalizeModelCallReceipt(p.usage.latest_model_call)
+      }
       break
     }
     case 'message.start':
       next.busy = true
       next.text = ''
+      next.latestCall = null
       break
     case 'message.delta':
       if (typeof p.text === 'string') next.text = ((prev.text || '') + p.text).slice(-LIVE_TEXT_CAP)
       break
     case 'session.usage':
-      if (p.usage && typeof p.usage === 'object') next.usage = { ...p.usage }
+      if (p.usage && typeof p.usage === 'object') {
+        next.usage = { ...p.usage }
+        if (p.usage.latest_model_call) next.latestCall = normalizeModelCallReceipt(p.usage.latest_model_call)
+      }
       break
     case 'message.complete':
+      if (p.usage && typeof p.usage === 'object') {
+        next.usage = { ...p.usage }
+        if (p.usage.latest_model_call) next.latestCall = normalizeModelCallReceipt(p.usage.latest_model_call)
+      }
       next.busy = false
       if (typeof p.text === 'string' && p.text) next.text = p.text.slice(-LIVE_TEXT_CAP)
-      if (p.usage && typeof p.usage === 'object') next.usage = { ...p.usage }
       next.lastComplete = { at: now, status: p.status || 'complete', error: p.error || '' }
-      // A turn that ends closes any tool still marked open.
       next.tools = prev.tools.map(t => (t.endedAt !== null ? t : {
         ...t, endedAt: now,
         verdict: p.error || !['complete', 'completed', 'done', 'success'].includes(p.status || 'complete') ? 'interrupted' : 'unknown',
@@ -4579,8 +4618,8 @@ function LiveCard() {
   const busy = !!(busyMap && busyMap[rid]) || !!(rec && rec.busy)
   const liveModel = (rec && rec.model) || model || ''
   const est = liveEstimate(usage, liveModel)
-  const stored = rows.find(r => r.id === (storedId || (rec && rec.storedId))) || null
-  const storedCost = stored ? sessionCost(stored) : null
+  const selectedSession = rows.find(r => r.id === (storedId || (rec && rec.storedId))) || null
+  const storedCost = selectedSession ? sessionCost(selectedSession) : null
   const childLive = liveTrueCost({
     ownUsd: 0,
     subagents: rec ? rec.subagents : [],
@@ -5711,34 +5750,51 @@ function Chip() {
   const usage = (rec && rec.usage) || focusedUsage || null
   const liveModel = (rec && rec.model) || model
   const est = rid ? liveEstimate(usage, liveModel) : null
-  const stored = rows.find(r => r.id === (storedId || (rec && rec.storedId))) || null
+  const lastCall = rec && rec.latestCall
+  const callModel = lastCall && lastCall.model ? lastCall.model : lastCall && lastCall.requestedModel
+  const modelLabel = callModel ? String(callModel).split('/').pop() : ''
+  const tokenTotal = lastCall && lastCall.total !== null ? fmtCount(lastCall.total) : ''
+  const lastCallCost = lastCall && lastCall.costUsd !== null ? fmtUsd(lastCall.costUsd) : ''
+  const latestParts = [modelLabel, lastCall && lastCall.provider, tokenTotal ? `${tokenTotal} tok` : '', lastCallCost ? `${lastCall.costStatus === 'estimated' ? '~' : ''}${lastCallCost}` : ''].filter(Boolean)
+  const latestLabel = latestParts.join(' · ')
+  const lastCallTip = lastCall ? [
+    `Latest model request · requested ${lastCall.requestedModel || 'unknown'}`,
+    `served ${callModel || 'unknown'}`,
+    lastCall.provider ? `via ${lastCall.provider}` : '',
+    lastCall.input === null ? 'tokens unavailable' : `${fmtCount(lastCall.input)} input / ${fmtCount(lastCall.output)} output tokens`,
+    lastCall.attemptedFallbacks ? `${lastCall.attemptedFallbacks} fallback(s)` : '',
+    lastCall.costUsd !== null ? `${lastCall.costStatus} ${fmtUsd(lastCall.costUsd)} (${lastCall.costSource})` : 'cost unknown'
+  ].filter(Boolean).join(' · ') : ''
+
+  const selectedSession = rows.find(r => r.id === (storedId || (rec && rec.storedId))) || null
   const busy = !!(rid && busyMap && busyMap[rid]) || !!(rec && rec.busy)
   const childLive = liveTrueCost({
     ownUsd: 0,
     subagents: rec ? rec.subagents : [],
     estimateChild: sa => estimateLiveChild(sa, liveModel)
   })
-  const storedTree = stored ? listTreeCost({ session: stored, index: childIndex(rows) }) : null
+  const storedTree = selectedSession ? listTreeCost({ session: selectedSession, index: childIndex(rows) }) : null
   const chipUsd = childLive.count
     ? (!busy && storedTree !== null ? storedTree : (est ? est.usd : 0) + childLive.usd)
     : est
       ? est.usd
       : null
-  const rate = stored ? cacheHitRate(stored.tokens) : null
+  const rate = selectedSession ? cacheHitRate(selectedSession.tokens) : null
   const parts = []
   const showEst = childLive.count ? busy || storedTree === null : !!est
   if (chipUsd !== null) parts.push(`${fmtUsd(chipUsd)}${showEst ? ` ${t('estSuffix')}` : ''}`)
   if (rate !== null) parts.push(`${fmtPct(rate)} ${t('cacheShort')}`)
   const label = parts.length ? parts.join(' · ') : t('paneTitle')
+  const statusLabel = latestLabel ? `${latestLabel}  |  ${label}` : label
 
   return jsx(Tip, {
-    label: `${PLUGIN_NAME} · ${t('gateway')} ${gateway} · ${mode}${est ? ` · ${est.source}` : ''}`,
+    label: `${lastCallTip ? `${lastCallTip} · ` : ''}${PLUGIN_NAME} · ${t('gateway')} ${gateway} · ${mode}${est ? ` · ${est.source}` : ''}`,
     children: jsxs('button', {
       type: 'button',
       onClick: () => host.navigate(ROUTE),
       className: cn('inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem]'),
       style: { color: text.tertiary },
-      children: [jsx(Codicon, { name: 'graph-line', size: 12 }), jsx('span', { children: label })]
+      children: [jsx(Codicon, { name: 'graph-line', size: 12 }), jsx('span', { children: statusLabel })]
     })
   })
 }
