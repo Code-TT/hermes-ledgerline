@@ -695,7 +695,7 @@ function sessionLabel(session) {
   if (session.title) return session.title
   if (session.preview) return session.preview.slice(0, 60)
   if (session.parentId) return 'Subagent'
-  return session.id.slice(0, 12)
+  return session.id ? String(session.id).slice(0, 12) : ''
 }
 
 function durationSeconds(session) {
@@ -4602,6 +4602,15 @@ function LiveSubagentRow({ sa, t }) {
 }
 
 function LiveCard() {
+  try {
+    return LiveCardInner()
+  } catch (error) {
+    console.error('[ledgerline] LiveCard render failed', error && error.stack || error)
+    return jsx('div', { style: { padding: 10, fontSize: '0.75rem', color: 'var(--ui-text-tertiary, #888)' }, children: `Ledgerline live card error: ${String(error && error.message || error)}` })
+  }
+}
+
+function LiveCardInner() {
   const t = useT()
   const rid = useValue(host.state.focusedSessionId)
   const storedId = useValue(host.state.focusedStoredSessionId || $absent)
@@ -4615,6 +4624,9 @@ function LiveCard() {
 
   if (!rid) return jsx(Muted, { style: { padding: 10 }, children: t('liveNoSession') })
   const rec = all[rid] || null
+  // Reducer paths can hand back a live record whose `subagents`/`tools` arrays were
+  // never initialized (e.g. a bare usage payload); never let a missing array crash the pane.
+  const subagentRows = (rec && Array.isArray(rec.subagents) ? rec.subagents : []) || []
   const usage = (rec && rec.usage) || focusedUsage || null
   const busy = !!(busyMap && busyMap[rid]) || !!(rec && rec.busy)
   const liveModel = (rec && rec.model) || model || ''
@@ -4623,7 +4635,7 @@ function LiveCard() {
   const storedCost = selectedSession ? sessionCost(selectedSession) : null
   const childLive = liveTrueCost({
     ownUsd: 0,
-    subagents: rec ? rec.subagents : [],
+    subagents: subagentRows,
     estimateChild: sa => estimateLiveChild(sa, liveModel)
   })
   const index = childIndex(rows)
@@ -4632,10 +4644,10 @@ function LiveCard() {
   const spentNow = busy || storedCost === null ? ownLive + childLive.usd : storedTree !== null ? storedTree : storedCost
   const spentEstimated = !!(busy || storedCost === null) && (est || childLive.estimated)
   const sessionBudget = budgetState(budgets, null, { cost: { actual: spentNow, estimated: spentNow } }, spentNow).session
-  const tools = rec ? rec.tools : []
+  const tools = rec ? (Array.isArray(rec.tools) ? rec.tools : []) : []
   const failed = tools.filter(x => x.verdict === 'failed').length
   const lastTool = tools.length ? tools[tools.length - 1] : null
-  const running = rec ? rec.subagents.filter(sa => !SUBAGENT_DONE.has(sa.status)) : []
+  const running = subagentRows.filter(sa => !SUBAGENT_DONE.has(sa.status))
   const ctx = usage && typeof usage.context_percent === 'number' ? usage.context_percent : null
 
   const line = (label, value, tone) =>
@@ -4669,11 +4681,11 @@ function LiveCard() {
       sessionBudget.limit !== null ? line(t('budgetSessionLabel'), `${fmtUsd(sessionBudget.spent)} / ${fmtUsd(sessionBudget.limit)}`, sessionBudget.level === 'over' || sessionBudget.level === 'near' ? 'bad' : undefined) : null,
       line(t('liveTools'), `${tools.length}${failed ? ` (${failed} ${t('failed')})` : ''}`, failed ? 'bad' : undefined),
       lastTool ? jsx(ToolLine, { tool: lastTool, t }) : null,
-      running.length || (rec && rec.subagents.length)
+      running.length || subagentRows.length
         ? jsxs('div', {
             children: [
               jsx('div', { style: { fontSize: '0.6875rem', color: text.tertiary, marginTop: 4 }, children: `${t('liveSubagents')} (${running.length} ${t('liveRunning')})` }),
-              ...rec.subagents.slice(-6).map(sa => jsx(LiveSubagentRow, { sa, t }, sa.key))
+              ...subagentRows.slice(-6).map(sa => jsx(LiveSubagentRow, { sa, t }, sa.key))
             ]
           })
         : null,
