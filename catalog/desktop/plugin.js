@@ -1137,6 +1137,7 @@ function reduceLiveEvent(state, event, now = Date.now()) {
       if (typeof p.running === 'boolean') next.busy = p.running
       if (p.usage && typeof p.usage === 'object') {
         next.usage = { ...p.usage }
+console.error('[ledgerline][dbg] evt', event.type, 'keys', Object.keys(p.usage||{}), 'receipt', JSON.stringify(p.usage&&p.usage.latest_model_call||null))
         if (p.usage.latest_model_call) next.latestCall = normalizeModelCallReceipt(p.usage.latest_model_call)
       }
       break
@@ -1151,11 +1152,13 @@ function reduceLiveEvent(state, event, now = Date.now()) {
       break
     case 'session.usage':
       if (p.usage && typeof p.usage === 'object') {
+console.error('[ledgerline][dbg] evt', event.type, 'keys', Object.keys(p.usage||{}), 'receipt', JSON.stringify(p.usage&&p.usage.latest_model_call||null))
         next.usage = { ...p.usage }
         if (p.usage.latest_model_call) next.latestCall = normalizeModelCallReceipt(p.usage.latest_model_call)
       }
       break
     case 'message.complete':
+console.error('[ledgerline][dbg] evt', event.type, 'keys', Object.keys(p.usage||{}), 'receipt', JSON.stringify(p.usage&&p.usage.latest_model_call||null))
       if (p.usage && typeof p.usage === 'object') {
         next.usage = { ...p.usage }
         if (p.usage.latest_model_call) next.latestCall = normalizeModelCallReceipt(p.usage.latest_model_call)
@@ -2097,6 +2100,7 @@ const LIVE_RECORD_CAP = 200
 const LIVE_RECORD_TTL_MS = 24 * 60 * 60 * 1000
 
 function applyLiveEvent(event) {
+if(!globalThis.__llEvts)globalThis.__llEvts={};const __k=event.type;if(!globalThis.__llEvts[__k]||Date.now()-globalThis.__llEvts[__k]>5000){globalThis.__llEvts[__k]=Date.now();console.error('[ledgerline][evt]',__k)}
   const rid = event && event.session_id
   if (!rid) return
   const all = $live.get()
@@ -4627,11 +4631,11 @@ function LiveCardInner() {
   // Reducer paths can hand back a live record whose `subagents`/`tools` arrays were
   // never initialized (e.g. a bare usage payload); never let a missing array crash the pane.
   const subagentRows = (rec && Array.isArray(rec.subagents) ? rec.subagents : []) || []
+  const selectedSession = rows.find(r => r.id === (storedId || (rec && rec.storedId))) || null
   const usage = (rec && rec.usage) || focusedUsage || null
   const busy = !!(busyMap && busyMap[rid]) || !!(rec && rec.busy)
   const liveModel = (rec && rec.model) || model || ''
   const est = liveEstimate(usage, liveModel)
-  const selectedSession = rows.find(r => r.id === (storedId || (rec && rec.storedId))) || null
   const storedCost = selectedSession ? sessionCost(selectedSession) : null
   const childLive = liveTrueCost({
     ownUsd: 0,
@@ -4639,7 +4643,7 @@ function LiveCardInner() {
     estimateChild: sa => estimateLiveChild(sa, liveModel)
   })
   const index = childIndex(rows)
-  const storedTree = stored ? listTreeCost({ session: stored, index }) : null
+  const storedTree = selectedSession ? listTreeCost({ session: selectedSession, index }) : null
   const ownLive = storedCost !== null && !busy ? storedCost : est ? est.usd : storedCost || 0
   const spentNow = busy || storedCost === null ? ownLive + childLive.usd : storedTree !== null ? storedTree : storedCost
   const spentEstimated = !!(busy || storedCost === null) && (est || childLive.estimated)
@@ -4677,7 +4681,7 @@ function LiveCardInner() {
         children: line(t('liveEstimate'), spentEstimated ? `${fmtUsd(spentNow)} ${t('estSuffix')}` : est ? `${fmtUsd(est.usd)} ${t('estSuffix')}` : t('liveNoRate'))
       }),
       childLive.count ? line(t('trueCost'), `${fmtUsd(spentNow)}${spentEstimated ? ` ${t('estSuffix')}` : ''}`) : null,
-      storedCost !== null ? line(t('spend'), `${fmtUsd(storedCost)} (${stored.cost.status || 'stored'})`) : null,
+      storedCost !== null ? line(t('spend'), `${fmtUsd(storedCost)} (${(selectedSession && selectedSession.cost && selectedSession.cost.status) || 'stored'})`) : null,
       sessionBudget.limit !== null ? line(t('budgetSessionLabel'), `${fmtUsd(sessionBudget.spent)} / ${fmtUsd(sessionBudget.limit)}`, sessionBudget.level === 'over' || sessionBudget.level === 'near' ? 'bad' : undefined) : null,
       line(t('liveTools'), `${tools.length}${failed ? ` (${failed} ${t('failed')})` : ''}`, failed ? 'bad' : undefined),
       lastTool ? jsx(ToolLine, { tool: lastTool, t }) : null,
@@ -5050,6 +5054,17 @@ async function effectiveBudgetsNow() {
 // register() on a timer while the gateway is open and analytics are
 // available.
 let monthCheckInFlight = false
+async function refreshKnownRowsInBackground() {
+  if (host.state.gateway.get() !== 'open') return
+  try {
+    const result = await data.listSessions({ pages: 1, archived: 'exclude' })
+    const merged = mergeKnownRows($knownRows.get(), $knownRowsScope.get(), result.rows, $knownRowsScope.get() || result.rows.length ? $knownRowsScope.get() : '', KNOWN_ROWS_CAP)
+    $knownRows.set(merged.rows)
+  } catch (error) {
+    // background refresh is best-effort; chip falls back to live estimate
+  }
+}
+
 async function checkMonthBudgetInBackground() {
   if (monthCheckInFlight || host.state.gateway.get() !== 'open' || $mode.get() !== 'full') return
   monthCheckInFlight = true
@@ -5763,11 +5778,14 @@ function Chip() {
   const usage = (rec && rec.usage) || focusedUsage || null
   const liveModel = (rec && rec.model) || model
   const est = rid ? liveEstimate(usage, liveModel) : null
+  const selectedSession = rows.find(r => r.id === (storedId || (rec && rec.storedId))) || null
   const lastCall = rec && rec.latestCall
   const callModel = lastCall
     ? (lastCall.modelName || lastCall.model || lastCall.requestedModel)
     : ''
-  const modelLabel = callModel ? String(callModel).split('/').pop() : ''
+  const modelLabel = callModel
+    ? String(callModel).split('/').pop()
+    : (selectedSession && selectedSession.model ? String(selectedSession.model).split('/').pop() : '')
   const tokenTotal = lastCall && lastCall.total !== null ? fmtCount(lastCall.total) : ''
   const lastCallCost = lastCall && lastCall.costUsd !== null ? fmtUsd(lastCall.costUsd) : ''
   const latestParts = [modelLabel, lastCall && lastCall.provider, tokenTotal ? `${tokenTotal} tok` : '', lastCallCost ? `${lastCall.costStatus === 'estimated' ? '~' : ''}${lastCallCost}` : ''].filter(Boolean)
@@ -5781,7 +5799,6 @@ function Chip() {
     lastCall.costUsd !== null ? `${lastCall.costStatus} ${fmtUsd(lastCall.costUsd)} (${lastCall.costSource})` : 'cost unknown'
   ].filter(Boolean).join(' · ') : ''
 
-  const selectedSession = rows.find(r => r.id === (storedId || (rec && rec.storedId))) || null
   const busy = !!(rid && busyMap && busyMap[rid]) || !!(rec && rec.busy)
   const childLive = liveTrueCost({
     ownUsd: 0,
@@ -5789,11 +5806,14 @@ function Chip() {
     estimateChild: sa => estimateLiveChild(sa, liveModel)
   })
   const storedTree = selectedSession ? listTreeCost({ session: selectedSession, index: childIndex(rows) }) : null
+  const dbCost = selectedSession ? sessionCost(selectedSession) : null
   const chipUsd = childLive.count
     ? (!busy && storedTree !== null ? storedTree : (est ? est.usd : 0) + childLive.usd)
     : est
       ? est.usd
-      : null
+      : dbCost !== null
+        ? dbCost
+        : null
   const rate = selectedSession ? cacheHitRate(selectedSession.tokens) : null
   const parts = []
   const showEst = childLive.count ? busy || storedTree === null : !!est
@@ -6192,6 +6212,8 @@ export default {
     onDispose(() => clearInterval(ratesTimer))
     const budgetTimer = setInterval(() => void checkMonthBudgetInBackground(), BUDGET_CHECK_MS)
     onDispose(() => clearInterval(budgetTimer))
+    const rowsTimer = setInterval(() => void refreshKnownRowsInBackground(), 30_000)
+    onDispose(() => clearInterval(rowsTimer))
     onDispose(() => {
       for (const off of backgroundWatchers.values()) off()
       backgroundWatchers.clear()
