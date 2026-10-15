@@ -75,6 +75,19 @@ test('gateway model-call receipt is the sole source of last-request attribution'
   assert.equal(unknown.latestCall.costUsd, null)
 })
 
+test('readable served model name wins over the opaque deployment id', () => {
+  const { run } = load()
+  const receipt = { call_index: 1, requested_model: 'grunt', served_model: 'a3170b36fef8e377e4870b303ed7ca42d9bdcf2739bbd236d76274374b6ac01b', served_model_name: 'openrouter/deepseek/deepseek-v4-flash', served_provider: 'GMICloud', input_tokens: 87, output_tokens: 8, total_tokens: 95, cost_usd: 3.9858e-06, cost_status: 'estimated', cost_source: 'litellm_response_header' }
+  run(`globalThis.namedReceipt = ${JSON.stringify(receipt)}`)
+  const named = run(`reduceLiveEvent(null,{type:'session.usage',session_id:'n',payload:{usage:{latest_model_call:namedReceipt}}},5)`)
+  assert.equal(named.latestCall.modelName, 'openrouter/deepseek/deepseek-v4-flash')
+  assert.equal(named.latestCall.model, 'a3170b36fef8e377e4870b303ed7ca42d9bdcf2739bbd236d76274374b6ac01b')
+  // A producer that predates the field must still fall back to the deployment id, not render empty.
+  const legacy = run(`reduceLiveEvent(null,{type:'session.usage',session_id:'l',payload:{usage:{latest_model_call:{call_index:2,requested_model:'plan',served_model:'deepseek/deepseek-v4-pro',cost_status:'estimated',cost_source:'litellm_response_header'}}}},6)`)
+  assert.equal(legacy.latestCall.modelName, '')
+  assert.equal(legacy.latestCall.model, 'deepseek/deepseek-v4-pro')
+})
+
 test('unfinished tools never become successful at turn completion', () => {
   const { run } = load()
   for (const status of ['failed', 'cancelled', 'complete']) {

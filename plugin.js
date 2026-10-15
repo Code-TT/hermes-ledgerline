@@ -1095,6 +1095,7 @@ function normalizeModelCallReceipt(receipt) {
     callIndex: num(receipt.call_index),
     requestedModel: String(receipt.requested_model || ''),
     model: String(receipt.served_model || ''),
+    modelName: String(receipt.served_model_name || ''),
     provider: String(receipt.served_provider || ''),
     apiBase: String(receipt.upstream_api_base || ''),
     input,
@@ -5751,7 +5752,9 @@ function Chip() {
   const liveModel = (rec && rec.model) || model
   const est = rid ? liveEstimate(usage, liveModel) : null
   const lastCall = rec && rec.latestCall
-  const callModel = lastCall && lastCall.model ? lastCall.model : lastCall && lastCall.requestedModel
+  const callModel = lastCall
+    ? (lastCall.modelName || lastCall.model || lastCall.requestedModel)
+    : ''
   const modelLabel = callModel ? String(callModel).split('/').pop() : ''
   const tokenTotal = lastCall && lastCall.total !== null ? fmtCount(lastCall.total) : ''
   const lastCallCost = lastCall && lastCall.costUsd !== null ? fmtUsd(lastCall.costUsd) : ''
